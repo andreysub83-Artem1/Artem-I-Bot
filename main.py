@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """✨ ARTEM AI ✨ — PLATFORM v9.0 (EXCLUSIVE EDITION)"""
 
-import os, re, json, logging, sqlite3, asyncio
+import asyncio
+import os, re, json, logging, sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -29,12 +30,11 @@ from prettytable import PrettyTable
 from loguru import logger as loguru_logger
 import sys
 
-# ──────────────────────────────────────────────────────────────────────
-# GOOGLE SHEETS INTEGRATION (Добавлено)
-# ──────────────────────────────────────────────────────────────────────
+#===========================================
+# GOOGLE SHEETS INTEGRATION
+#===========================================
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-
 
 def get_google_sheet():
     """Подключение к таблице Artem I Proekt"""
@@ -46,20 +46,20 @@ def get_google_sheet():
     client = gspread.authorize(creds)
     return client.open("Artem I Proekt").sheet1
 
-
 # ==========================================
 # БЛОК 1: ФИЛЬТРЫ (Исправлено для работы)
 # ==========================================
 from telegram.ext.filters import BaseFilter
 
-
 class PhoneFilter(BaseFilter):
-    # 🔥 ИСПРАВЛЕНИЕ: Имя функции изменено на 'filter' (обязательно для версии 20.7)
+    """Строгая валидация номера: +7XXXXXXXXXX или 8XXXXXXXXXX (10-11 цифр)"""
+    _PHONE_RE = re.compile(r"^\+?[78]?\d{10}$")
+
     def filter(self, update: Update) -> bool:
         if not update.message or not update.message.text:
             return False
-        clean = re.sub(r"\D", "", update.message.text)
-        return 10 <= len(clean) <= 12
+        clean = re.sub(r"[\s\-\(\)]", "", update.message.text.strip())
+        return bool(self._PHONE_RE.match(clean))
 
 
 class PriceFilter(BaseFilter):
@@ -106,7 +106,9 @@ children_filter = ChildrenFilter()
 # БЛОК 2: НАСТРОЙКИ
 # ──────────────────────────────────────────────────────────────────────
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
+_raw_token = os.getenv("BOT_TOKEN", "").strip()
+# 🔥 Защита: если токен содержит "BOT_TOKEN=" — обрезаем лишнее
+TOKEN = _raw_token.split("BOT_TOKEN=")[-1] if "BOT_TOKEN=" in _raw_token else _raw_token
 
 # 🔥 ИСПРАВЛЕНИЕ: Приводим ID к числу (чтобы бот точно узнал тебя)
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", 0))
@@ -152,18 +154,15 @@ AI_TRIGGERS = {
         "keys": ["продать", "оценка", "выставить", "реклама", "спрос"],
         "msg": "📢 Чтобы продать быстро, создаем спрос: проф. съемка, 5+ площадок. Опиши объект — предложу стратегию.",
     },
+    "другой_город": {
+        "keys": ["другой город", "другом городе", "москва", "владивосток", "хабаровск",
+                 "санкт-петербург", "спб", "новосибирск", "краснодар", "работаете в",
+                 "охватываете", "по всей стране"],
+        "msg": "🗺 По этому вопросу более полную информацию Вам лучше уточнить у нашего менеджера — он расскажет всё детально. А пока давайте я помогу с Вашим запросом здесь! Чем могу быть полезен?",
+    },
 }
 
 
-def ai_trigger_check(text: str):
-    if not text:
-        return None
-    t = text.lower()
-    for topic, data in AI_TRIGGERS.items():
-        if any(k in t for k in data["keys"]):
-            loguru_logger.info(f"⚡ Триггер: [{topic.upper()}]")
-            return data["msg"]
-    return None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -175,6 +174,7 @@ def ai_trigger_check(text: str):
     CHOICE,
     # Продавец
     SELL_OBJ,
+    SELL_SOTOK,
     SELL_LOC,
     SELL_AREA,
     SELL_TIME,
@@ -190,8 +190,17 @@ def ai_trigger_check(text: str):
     # Добавлено для логики опеки
     SELL_CHILDREN_AGE,
     SELL_REASON,
+    SELL_MATERIAL,
+    SELL_OWNERSHIP,
+    SELL_KADASTR,
+    SELL_FUNDAMENT,
+    SELL_OBREM,
+    SELL_YEARS,
     # Покупатель
     BUY_OBJ,
+    BUY_SOTOK,
+    BUY_LAND_PURPOSE,
+    BUY_BUILDER_SEARCH,
     BUY_LOC,
     BUY_BUDGET,
     BUY_INFRA,
@@ -214,6 +223,15 @@ def ai_trigger_check(text: str):
     # Добавлено для логики ипотечного калькулятора
     MORT_RESULT,
     MORT_RATE,
+    # Земля (расширенная воронка)
+    LAND_TYPE,
+    LAND_AREA,
+    LAND_LOC,
+    LAND_COMM,
+    # Стройка (расширенная воронка)
+    BUILD_TYPE,
+    BUILD_AREA,
+    BUILD_TIME,
     # Контакты и Финал
     SELL_PHONE,
     BUY_PHONE,
@@ -223,7 +241,8 @@ def ai_trigger_check(text: str):
     CONTINUE_PRESSED,  # 🔥 Добавлено
     # AI
     AI_CHAT,
-) = range(44)  # 🔥 Исправлено: было 40, стало 44
+    BUILD_LOC,  # 🗺 Местоположение для Стройки (карта)
+) = range(62)  # 🔥 Обновлено: было 61, стало 62 (добавлен BUILD_LOC)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -287,6 +306,12 @@ AI_TRIGGERS = {
         "keys": ["продать", "оценка", "выставить", "реклама", "спрос"],
         "msg": "📢 Чтобы продать быстро, создаем спрос: проф. съемка, 5+ площадок. Опиши объект — предложу стратегию.",
     },
+    "другой_город": {
+        "keys": ["другой город", "другом городе", "москва", "владивосток", "хабаровск",
+                 "санкт-петербург", "спб", "новосибирск", "краснодар", "работаете в",
+                 "охватываете", "по всей стране"],
+        "msg": "🗺 По этому вопросу более полную информацию Вам лучше уточнить у нашего менеджера — он расскажет всё детально. А пока давайте я помогу с Вашим запросом здесь! Чем могу быть полезен?",
+    },
 }
 
 
@@ -309,7 +334,26 @@ async def ai_trigger_handler(update: Update, context):
     # Возвращаемся в меню (воронка не сбрасывается)
     return CHOICE
 
+# ==========================================
+# ОБРАБОТЧИКИ КНОПОК МЕНЮ (ДОБАВЛЕНО)
+# ==========================================
+async def handle_sell(update, context):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Вы выбрали <b>ПРОДАЖУ</b>. Начнем заполнение анкеты.", parse_mode="HTML")
+    return SELL_OBJ
 
+async def handle_buy(update, context):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Вы выбрали <b>ПОКУПКУ</b>. Давайте подберем объект.", parse_mode="HTML")
+    return BUY_OBJ
+
+async def handle_rent(update, context):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Вы выбрали <b>АРЕНДУ</b>. Переходим к подбору.", parse_mode="HTML")
+    return RENT_DUR
 # 2. МОДУЛЬ OPEN AI
 ai_client = (
     OpenAI(api_key=OPENAI_API_KEY)
@@ -318,9 +362,14 @@ ai_client = (
 )
 
 # 🔹 ТВОЙ ПРОМПТ (оставлен без изменений)
-AI_SYSTEM_PROMPT = """Ты — профессиональный ассистент агентства ARTEM AI во главе с Андреем.
-Твой стиль: мягкий, уважительный, ласковый, гибкий, профессиональный, специалист в сфере недвижимости.
-Твоя цель: бережно взять номер телефона клиента и аккуратно вывести на встречу с менеджером."""
+AI_SYSTEM_PROMPT = """Ты — Артём I, цифровой партнёр агентства ARTEM AI, созданного Андреем — экспертом с 17-летним опытом в недвижимости.
+Твой характер: тёплый, живой, с лёгким юмором и хитринкой. Ты заботливый, но всегда по делу.
+Твой стиль: мягкий, уважительный, профессиональный. Обращайся к клиенту строго по имени (4-5 раз за диалог). Никакого "друг", "гость", "уважаемый".
+Твоя цель: бережно познакомиться с клиентом, собрать его запрос и аккуратно подготовить к встрече с Андреем.
+Используй эмодзи умеренно. Паузы между вопросами — естественные. Простые вопросы, без головоломок.
+География работы: Корсаков и Южно-Сахалинск (42 км друг от друга). Это основные города присутствия агентства.
+Корсаков — портовый город на юге Сахалина. Южно-Сахалинск — столица области, крупнейший центр региона.
+Если клиент не уточнил город — мягко уточни: Корсаков, Южно-Сахалинск или пригород?"""
 
 
 async def ask_ai(text, context):
@@ -344,9 +393,18 @@ async def ask_ai(text, context):
         return "🤖 Задумался... Попробуйте позже."
 
 
-def clean(t):
-    return re.sub(r"[^\w\s\.\-\/]", "", t).strip()
-
+def parse_number(text: str):
+    if not text:
+        return 0.0
+    s = text.lower().replace(" ", "").replace(",", ".")
+    if "млн" in s:
+        return float(s.replace("млн", "")) * 1_000_000
+    if "тыс" in s or "к" in s:
+        return float(s.replace("тыс", "").replace("к", "")) * 1_000
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
 
 # ──────────────────────────────────────────────────────────────────────
 # 6. УВЕДОМЛЕНИЯ + СОХРАНЕНИЕ + ЯНДЕКС
@@ -400,16 +458,78 @@ async def save_lead(context, edit_note=None):
     # 📊 GOOGLE SHEETS (ЗАПИСЬ В ТАБЛИЦУ)
     try:
         sheet = get_google_sheet()
+                # 🔥 АВТО-ШАПКА (ВСТАВЛЯЕМ СЮДА)
+        if sheet.acell('A1').value is None:
+            headers = [
+                "Дата", "Источник", "Клиент", "Объект", "Цена", 
+                "Телефон", "Специфика", "Статус", "Широта", "Долгота"
+            ]
+            sheet.update('A1:J1', [headers])
+            sheet.format('A1:J1', {
+                "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2},
+                "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}}
+            })
+
         lead_type = d.get("type", "unknown")
+        obj_type = d.get("object", "")
+
+        # 🌲 Доп. поля для Земли и Стройки
+        if obj_type == "Земля":
+            extra = " | ".join(filter(None, [
+                d.get("land_type", ""),
+                f"{d.get('land_area', '')} сот." if d.get("land_area") else "",
+                d.get("land_comm", ""),
+            ]))
+            location = d.get("land_loc", d.get("location", ""))
+        elif obj_type == "Стройка":
+            extra = " | ".join(filter(None, [
+                d.get("build_type", ""),
+                f"{d.get('build_area', '')} м²" if d.get("build_area") else "",
+                d.get("build_time", ""),
+            ]))
+            location = d.get("location", "")
+        else:
+            extra = ""
+            location = d.get("location", "")
+
+        _timing_raw = (
+            d.get("timing", "") or d.get("build_time", "") or ""
+        ).lower()
+        if "срочно" in _timing_raw or "как можно скорее" in _timing_raw:
+            _status_emoji = "🔥"
+        elif any(w in _timing_raw for w in ["изучаю", "смотр", "планирую", "мониторю"]):
+            _status_emoji = "⏳"
+        else:
+            _status_emoji = "✅"
+            
+        # 🔥 АВТО-ШАПКА (Перед записью проверяем лист)
+        try:
+            if sheet.acell('A1').value is None:
+                headers = [
+                    "Дата", "Источник", "Клиент", "Объект", "Цена", 
+                    "Телефон", "Специфика", "Статус", "Широта", "Долгота"
+                ]
+                sheet.update('A1:J1', [headers])
+                sheet.format('A1:J1', {
+                    "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2},
+                    "textFormat": {"bold": True, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}}
+                })
+        except Exception as e:
+            loguru_logger.error(f"Ошибка создания шапки: {e}")
+
+        _lat = d.get("latitude", "")
+        _lon = d.get("longitude", "")
         row = [
             datetime.now().strftime("%d.%m.%Y %H:%M"),
             "Telegram Bot",
             d.get("client_name", "-"),
-            f"{d.get('object', '')} | {d.get('location', '')}",
+            f"{obj_type} | {location}",
             str(d.get("price") or d.get("budget_rent") or ""),
             d.get("phone", ""),
-            "",  # Ссылка
-            "В РАБОТЕ" if lead_type in ["sell", "buy"] else "",
+            extra,  # Специфика Земли/Стройки
+            f"{_status_emoji} В РАБОТЕ" if lead_type in ["sell", "buy"] else _status_emoji,
+            str(_lat) if _lat else "",   # Широта
+            str(_lon) if _lon else "",   # Долгота
         ]
         sheet.append_row(row)
     except Exception as e:
@@ -519,8 +639,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_obj = last_lead["object"] or "?"
         last_type = last_lead["type"] or "?"
 
+        _h = datetime.now().hour
+        if 5 <= _h <= 11:
+            _back_greeting = "☀️ Доброе утро"
+        elif 12 <= _h <= 17:
+            _back_greeting = "🌤 Добрый день"
+        elif 18 <= _h <= 23:
+            _back_greeting = "🌆 Добрый вечер"
+        else:
+            _back_greeting = "🌙 Доброй ночи"
+
         welcome_back = (
-            f"👋 <b>Рады видеть Вас снова!</b>\n\n"
+            f"<b>{_back_greeting}!</b> 👋\n\n"
+            f"<b>Рады видеть Вас снова!</b>\n\n"
             f"В прошлый раз ({last_date}) Вы интересовались: {last_type} — {last_obj}\n"
             f"<b>Чем в этот раз могу быть Вам полезен?</b>"
         )
@@ -534,13 +665,26 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CHOICE
 
     # === ВАРИАНТ Б: НОВЫЙ КЛИЕНТ ===
+    _hour = datetime.now().hour
+    if 5 <= _hour <= 11:
+        _greeting = "☀️ Доброе утро"
+    elif 12 <= _hour <= 17:
+        _greeting = "🌤 Добрый день"
+    elif 18 <= _hour <= 23:
+        _greeting = "🌆 Добрый вечер"
+    else:
+        _greeting = "🌙 Доброй ночи"
+
     welcome_text = (
-        "🌿 <b>Здравствуйте, уважаемый гость!</b>\n\n"
-        "Меня зовут <b>Артём</b>. Я Ваш цифровой помощник.\n"
-        "Проект создан на основе 20 лет практики в сфере недвижимости.\n"
-        "Моя задача — сэкономить Ваше время и бережно подготовить всё для сделки.\n\n"
-        "🎉 <b>Добро пожаловать!</b>\n\n"
-        "Нажмите кнопку ниже, чтобы продолжить:"
+        f"<b>{_greeting}!</b> ✨\n\n"
+        "✨ <b>Добро пожаловать в ARTEM I ✨</b>\n\n"
+        "Меня зовут <b>Артём I</b>. Я ваш цифровой помощник.\n"
+        "За моей спиной — 17 лет практики в сфере недвижимости.\n"
+        "Поверьте, я видел и квартиры с видом на море, и фундаменты, "
+        "которые держались только на честном слове. Но не переживайте! 😉\n\n"
+        "Моя задача — избавить вас от головной боли, сэкономить время\n"
+        "и бережно подготовить всё для вашей сделки.\n\n"
+        "👇 <b>Нажмите кнопку ниже, чтобы я познакомился с вами поближе.</b>"
     )
     kb = ReplyKeyboardMarkup([["▶️ Продолжим"]], resize_keyboard=True)
     await update.message.reply_text(welcome_text, reply_markup=kb, parse_mode="HTML")
@@ -615,18 +759,28 @@ async def back_to_menu(update, context):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 9. МАРШРУТИЗАЦИЯ (ОБНОВЛЁННЫЙ — только 3 основные ветки)
+# 9. МАРШРУТИЗАЦИЯ (ОБНОВЛЁННЫЙ — одна кнопка в приложение)
 # ──────────────────────────────────────────────────────────────────────
 async def route_choice(update, context):
     text = update.message.text
+    name = context.user_data["client_name"]
     context.user_data["type"] = None
 
-    # 🔥 Ищем по названию кнопок из чистого меню
+    # 🔥 Если клиент нажал кнопку "🚀 Открыть приложение" (через Inline-меню), 
+    # он уже попал в mini_app.html. Здесь мы просто не даём уйти в старые воронки.
+    if "Открыть приложение" in text:
+        await update.message.reply_text(
+            "🚀 Переход в приложение уже выполнен.\n"
+            "Если приложение не открылось, нажми кнопку еще раз.",
+            parse_mode="HTML"
+        )
+        return CHOICE
 
+    # 🔥 Ищем по названию кнопок для старых/альтернативных входов
     if "Продать недвижимость" in text:
         context.user_data["type"] = "sell"
         await update.message.reply_text(
-            "💰 <b>Продажа</b>\nЧто планируете продавать?",
+            f"💰 <b>Продажа</b>\nЧто планируете продавать?",
             reply_markup=ReplyKeyboardMarkup(
                 [
                     ["🏠 Квартира"],
@@ -646,7 +800,7 @@ async def route_choice(update, context):
     elif "Купить недвижимость" in text:
         context.user_data["type"] = "buy"
         await update.message.reply_text(
-            "🔍 <b>Покупка</b>\nЧто ищете?",
+            f"🔍 <b>Покупка</b>\nЧто ищете?",
             reply_markup=ReplyKeyboardMarkup(
                 [
                     ["🏠 Квартира"],
@@ -665,7 +819,7 @@ async def route_choice(update, context):
     elif "Арендовать" in text:
         context.user_data["type"] = "rent"
         await update.message.reply_text(
-            "🔑 <b>Аренда</b>\nНа какой срок?",
+            f"🔑 <b>Аренда</b>\nНа какой срок?",
             reply_markup=ReplyKeyboardMarkup(
                 [
                     ["📅 От 1 года"],
@@ -683,14 +837,15 @@ async def route_choice(update, context):
     # 🔹 Все остальные нажатия возвращают в меню без сброса воронки
     return CHOICE
 
-
 # ──────────────────────────────────────────────────────────────────────
-# БЛОК: ВОПРОСЫ ПРОДАВЦА (Воронка: Объект → Цена → Обременения → Контакты)
+# БЛОК: ВОПРОСЫ ПРОДАВЦА (Воронка: Объект → Сотки → Локация → 6 деталей → Площадь → Цена → Контакты)
 # ──────────────────────────────────────────────────────────────────────
 
 
 async def s_obj(u, c):
     """🏠 Какой тип объекта продаём?"""
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
     c.user_data["object"] = (
         u.message.text.replace("🏠 ", "")
         .replace("🏡 ", "")
@@ -699,32 +854,131 @@ async def s_obj(u, c):
         .replace("🏗️ ", "")
     )
     await u.message.reply_text(
-        "Принято! 📍 <b>Подскажите, где расположен ваш объект?</b>\n"
+        f"Принято, {name}! 📍 <b>Подскажите, где расположен ваш объект?</b>\n"
         "Напишите адрес, район или просто ориентиры.\n"
         "<i>Если участок без адреса — опишите: 'рядом с заправкой'</i> 😉",
         reply_markup=get_back_kb(),
         parse_mode="HTML",
+    )
+    return SELL_SOTOK
+
+
+async def s_sotok(u, c):
+    """📍 Запоминаем количество соток"""
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["sotok"] = parse_number(u.message.text)
+    await u.message.reply_text(
+        f"📍 {name}, а сколько соток земли в собственности под домом?",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
     )
     return SELL_LOC
 
 
 async def s_loc(u, c):
     """📍 Запоминаем локацию"""
-    c.user_data["location"] = clean(u.message.text)
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["location"] = u.message.text
+
     await u.message.reply_text(
-        "Подскажите, пожалуйста, а какова общая площадь Вашего объекта по документам? 📐\n"
-        "<i>Укажите в м² — например, 45 или 120.5</i>",
+        f"Отлично, {name}! Давайте уточним детали объекта.\n\n"
+        "Ответьте на вопросы по очереди. Начнем с первого:\n\n"
+        "1️⃣ <b>Из чего построен дом?</b> (кирпич, газоблок, дерево, СИП)",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML",
+    )
+    return SELL_MATERIAL
+
+
+# ==========================================
+# 6 НОВЫХ ПРОСТЫХ ВОПРОСОВ (без сложных списков)
+# ==========================================
+async def s_material(u, c):
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["house_material"] = u.message.text
+    await u.message.reply_text(
+        f"📄 {name}, а оформлен ли дом в собственность? (да/нет)",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return SELL_OWNERSHIP
+
+
+async def s_ownership(u, c):
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["house_ownership"] = u.message.text
+    await u.message.reply_text(
+        f"🏛️ {name}, а стоит ли дом на кадастровом учете? (да/нет)",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return SELL_KADASTR
+
+
+async def s_kadastr(u, c):
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["house_kadastr"] = u.message.text
+    await u.message.reply_text(
+        f"🏗️ {name}, а какой тип фундамента? (лента, сваи, плита)",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return SELL_FUNDAMENT
+
+
+async def s_fundament(u, c):
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["house_fundament"] = u.message.text
+    await u.message.reply_text(
+        f"⚠️ {name}, есть ли обременения/аресты/ипотека? (да/нет)",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return SELL_OBREM
+
+
+async def s_obrem(u, c):
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["house_obrem"] = u.message.text
+    await u.message.reply_text(
+        f"📅 {name}, а как давно дом в собственности? (например: 2 года)",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return SELL_YEARS
+
+
+async def s_years(u, c):
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["house_years"] = u.message.text
+    await u.message.reply_text(
+        f"📐 {name}, спасибо! И последнее по объекту.\n"
+        "Подскажите общую площадь по документам (в м²).\n"
+        "<i>Например: 45 или 120.5</i>",
         reply_markup=get_back_kb(),
         parse_mode="HTML",
     )
     return SELL_AREA
 
 
+# ==========================================
+# ДАЛЬШЕ СТАРЫЕ ПРОВЕРЕННЫЕ ФУНКЦИИ
+# ==========================================
 async def s_area(u, c):
     """📐 Запоминаем площадь"""
-    c.user_data["area"] = clean(u.message.text)
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["area"] = parse_number(u.message.text)
     await u.message.reply_text(
-        "Отлично! ⏳ <b>Как скоро планируете продажу?</b>\n"
+        f"Отлично, {name}! ⏳ <b>Как скоро планируете продажу?</b>\n"
         "<i>Выберите вариант или напишите свой срок</i>",
         reply_markup=ReplyKeyboardMarkup(
             [
@@ -744,9 +998,11 @@ async def s_area(u, c):
 
 async def s_time(u, c):
     """⏳ Запоминаем сроки"""
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
     c.user_data["timing"] = u.message.text
     await u.message.reply_text(
-        "Понял вас! 💰 <b>На какую сумму вы ориентируетесь?</b>\n"
+        f"Понял, {name}! 💰 <b>На какую сумму вы ориентируетесь?</b>\n"
         "Можно точную цифру или вилку: <i>5-5.5 млн</i>",
         reply_markup=get_back_kb(),
         parse_mode="HTML",
@@ -756,9 +1012,11 @@ async def s_time(u, c):
 
 async def s_price(u, c):
     """💰 Запоминаем цену"""
-    c.user_data["price"] = clean(u.message.text)
+    name = c.user_data["client_name"]
+    await asyncio.sleep(0.8)
+    c.user_data["price"] = parse_number(u.message.text)
     await u.message.reply_text(
-        "Спасибо! 📜 <b>Есть ли обременения на объекте?</b>\n"
+        f"Спасибо, {name}! 📜 <b>Есть ли обременения на объекте?</b>\n"
         "<i>Ипотека, опека, арест или всё чисто?</i>",
         reply_markup=ReplyKeyboardMarkup(
             [["✅ Нет"], ["🏦 Ипотека"], ["⚖️ Опека/Арест"], ["◀️ Назад"], ["❌ Отмена"]],
@@ -791,12 +1049,12 @@ async def s_enc(u, c):
 
 
 async def s_mort(u, c):
-    c.user_data["mortgage_details"] = clean(u.message.text)
+    c.user_data["mortgage_details"] = parse_number(u.message.text)
     return await ask_own(u, c)
 
 
 async def s_guard_count(u, c):
-    c.user_data["children_count"] = clean(u.message.text)
+    c.user_data["children_count"] = parse_number(u.message.text)
     await u.message.reply_text(
         "🎂 <b>Укажите возраст детей</b> (через запятую).\n<i>Пример: 5, 12, 17</i>",
         reply_markup=get_back_kb(),
@@ -806,11 +1064,11 @@ async def s_guard_count(u, c):
 
 
 async def s_guard_age(u, c):
-    c.user_data["children_ages"] = clean(u.message.text)
+    c.user_data["children_ages"] = u.message.text
     await u.message.reply_text(
         "🏠 <b>Уже подобрано новое жильё для детей?</b>",
         reply_markup=ReplyKeyboardMarkup(
-            [["✅ Да, уже нашли"], [" Нет, в поиске"], ["◀️ Назад"]],
+            [["✅ Да, уже нашли"], ["❌ Нет, в поиске"], ["◀️ Назад"]],
             resize_keyboard=True,
         ),
         parse_mode="HTML",
@@ -831,7 +1089,7 @@ async def s_guard_housing(u, c):
 
 
 async def s_guard_search(u, c):
-    c.user_data["search_prefs"] = clean(u.message.text)
+    c.user_data["search_prefs"] = u.message.text
     return await ask_own(u, c)
 
 
@@ -862,23 +1120,23 @@ async def s_own(u, c):
 
 
 async def s_docs(u, c):
-    c.user_data["docs"] = clean(u.message.text)
+    c.user_data["docs"] = u.message.text
     return await ask_phone_geo(u, c)
 
 
-# ──────────────────────────────────────────────────────────────────────
+#──────────────────────────────────────────────────────────────────────
 # 🔥 ФИНАЛ: ТЕЛЕФОН + ГЕОЛОКАЦИЯ + ПОЛНАЯ КАРТОЧКА АДМИНУ (ОБНОВЛЁННЫЙ)
 # ──────────────────────────────────────────────────────────────────────
 
 
 async def ask_phone_geo(u, c):
     """📱 Мягкий запрос телефона + геолокация объекта"""
-    name = c.user_data.get("client_name", "друг")
+    name = c.user_data["client_name"]
     kb = ReplyKeyboardMarkup(
         [
             [
                 KeyboardButton("📱 Отправить номер", request_contact=True),
-                KeyboardButton("📍 Указать объект на карте", request_location=True),
+                KeyboardButton("📍 Открыть карту", web_app=WebAppInfo(url=f"{WEBAPP_URL}/map.html")),
             ],
             ["◀️ Назад"],
             ["❌ Отмена"],
@@ -910,7 +1168,7 @@ async def sell_phone(update, context):
         )
         return SELL_PHONE
     else:
-        context.user_data["phone"] = clean(update.message.text)
+        context.user_data["phone"] = parse_number(update.message.text)
     return await ask_add_more(update, context)
 
 
@@ -925,7 +1183,7 @@ async def rent_phone(update, context):
 
 async def ask_add_more(update, context):
     """📋 Резюме + вопрос: добавить деталь?"""
-    name = context.user_data.get("client_name", "друг")
+    name = context.user_data["client_name"]
     summary = (
         f"📋 <b>Резюме, {name}:</b>\n\n"
         f"• Объект: {context.user_data.get('object', '?')}\n"
@@ -941,166 +1199,235 @@ async def ask_add_more(update, context):
     return CONFIRM_ADD
 
 
-async def handle_add_more(update, context):
-    """✍️ Если клиент хочет добавить заметку"""
-    if "Да" in update.message.text or "заметку" in update.message.text.lower():
-        await update.message.reply_text(
-            "✍️ <b>Напишите, что важно добавить:</b>\n"
-            "<i>(например: «срочно до конца месяца» или «важна тихая улица»)</i>",
-            reply_markup=ReplyKeyboardMarkup(
-                [["✅ Готово, отправить"]], resize_keyboard=True
-            ),
-            parse_mode="HTML",
-        )
-        return ADD_NOTE_STATE
+async def _handle_add_more_v1(update, context):
+    """⚠️ ДУБЛЬ — не используется, оставлен для совместимости"""
+    return await handle_add_more(update, context)
+
+
+async def _final_thanks_v1(update, context):
+    """⚠️ ДУБЛЬ удалён — вся логика в финальной final_thanks_and_send"""
     return await final_thanks_and_send(update, context)
-
-
-async def save_note_and_finish(update, context):
-    """💾 Сохраняем заметку и идём на финал"""
-    context.user_data["edit_note"] = update.message.text
-    return await final_thanks_and_send(update, context)
-
-
-async def final_thanks_and_send(update, context):
-    """🎯 ПОЛНАЯ КАРТОЧКА АДМИНУ + СЕКРЕТНЫЙ БЛОК + БЛАГОДАРНОСТЬ КЛИЕНТУ"""
-    # 🔥 КАРТОЧКА УХОДИТ АДМИНУ ТОЛЬКО ПОСЛЕ ПОЛУЧЕНИЯ ТЕЛЕФОНА
-    await save_lead(context)
-    name = context.user_data.get("client_name", "Клиент")
-
-    # 📨 ФОРМИРУЕМ КАРТОЧКУ ДЛЯ ТЕБЯ (ПОЛНАЯ)
-    summary = [
-        f"🆕 <b>НОВАЯ ЗАЯВКА [{context.user_data.get('type', '?').upper()}]</b>",
-        f"👤 Клиент: {name}",
-        f"📞 Телефон: {context.user_data.get('phone', '?')}",
-    ]
-
-    obj = context.user_data.get("object", "?")
-    summary.append(
-        f"\n🏠 <b>ОБЪЕКТ:</b>\n• Тип: {obj}\n• Район: {context.user_data.get('location', '?')}"
-    )
-    if context.user_data.get("area"):
-        summary.append(f"• Площадь: {context.user_data['area']} м²")
-    if context.user_data.get("ownership"):
-        summary.append(f"• В собственности: {context.user_data['ownership']}")
-    if context.user_data.get("docs"):
-        summary.append(f"• Документы: {context.user_data['docs']}")
-
-    summary.append(
-        f"\n💰 <b>ФИНАНСЫ:</b>\n• Цена: {context.user_data.get('price', '?')} ₽"
-    )
-    if (
-        context.user_data.get("encumbrance")
-        and context.user_data["encumbrance"] != "Нет"
-    ):
-        summary.append(f"• Обременение: {context.user_data['encumbrance']}")
-    if context.user_data.get("mortgage_details"):
-        summary.append(
-            f"• Ипотека (остаток): {context.user_data['mortgage_details']} ₽"
-        )
-
-    if context.user_data.get("children_count"):
-        summary.append(
-            f"\n👶 <b>ДЕТИ:</b>\n• Кол-во: {context.user_data['children_count']}"
-        )
-        if context.user_data.get("children_ages"):
-            summary.append(f"• Возраст: {context.user_data['children_ages']}")
-        if context.user_data.get("housing_found"):
-            summary.append(f"• Жильё найдено: {context.user_data['housing_found']}")
-        if context.user_data.get("search_prefs"):
-            summary.append(f"• Ищет взамен: {context.user_data['search_prefs']}")
-
-    if context.user_data.get("timing"):
-        summary.append(
-            f"\n⏰ <b>СРОКИ:</b>\n• Планирует: {context.user_data['timing']}"
-        )
-    if context.user_data.get("edit_note"):
-        summary.append(f"\n📝 <b>ЗАМЕТКА:</b>\n{context.user_data['edit_note']}")
-
-    # 🗺 ГЕОЛОКАЦИЯ (если есть)
-    lat, lon = context.user_data.get("latitude"), context.user_data.get("longitude")
-    if lat and lon:
-        yandex_url = f"https://yandex.ru/maps/?pt={lon},{lat}&z=16&l=map"
-        summary.append(
-            f"\n📍 <b>ГЕОЛОКАЦИЯ:</b>\n🗺 <a href='{yandex_url}'>Открыть на карте</a>"
-        )
-
-    # 🔒 СЕКРЕТНЫЙ БЛОК (ТОЛЬКО ТЕБЕ — ИНСАЙТЫ + ССЫЛКИ)
-    secret_notes = []
-    timing = str(context.user_data.get("timing", "")).lower()
-    if "срочно" in timing:
-        secret_notes.append("🔥 Клиент торопится!")
-    if "изучаю" in timing or "смотр" in timing:
-        secret_notes.append("👀 Пока просто мониторит рынок")
-    if not context.user_data.get("price") or context.user_data.get("price") == "?":
-        secret_notes.append("💰 Не указал цену → нужна помощь с оценкой")
-    if context.user_data.get("encumbrance") == "Ипотека":
-        secret_notes.append("🏦 Нужна помощь с банком/одобрением")
-    if context.user_data.get("encumbrance") in ["Опека", "Арест"]:
-        secret_notes.append("⚖️ Сложная сделка (органы опеки/юрист)")
-    if context.user_data.get("object") in ["Земля", "Стройка"]:
-        secret_notes.append("🌲 Спец. объект → проверить коммуникации/документы")
-
-    if secret_notes:
-        summary.append(
-            f"\n\n🔒 <b>СЕКРЕТНО ДЛЯ МЕНЕДЖЕРА:</b>\n"
-            + "\n".join([f"• {n}" for n in secret_notes])
-        )
-        # 🔗 БЫСТРЫЕ ССЫЛКИ ДЛЯ ПОИСКА (подставляются по параметрам)
-        loc = context.user_data.get("location", "сахалин").replace(" ", "+")
-        price = context.user_data.get("price", "5000000")
-        summary.append(
-            f"\n🔍 <b>БЫСТРЫЙ ПОИСК ДЛЯ МЕНЕДЖЕРА:</b>\n"
-            f"• <a href='https://www.avito.ru/sahalinskaya_oblast/nedvizhimost/prodam-ASgBAgICAUSSVA9gAUSQ?q={loc}'>Авито: {loc}</a>\n"
-            f"• <a href='https://cian.ru/search/sale/flat/sahalinskaya-oblast/?region=4429&price={price}'>ЦИАН: до {price}₽</a>"
-        )
-
-    summary_text = "\n".join(summary)
-
-    # 🔥 ОТПРАВЛЯЕМ ТЕБЕ
-    if ADMIN_CHAT_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=summary_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки заявки: {e}")
-
-    # 💬 ОТВЕТ КЛИЕНТУ (мягкий, с удержанием + просьба о рекомендации)
-    final_text = (
-        f"✨ <b>Благодарю Вас, {name}, что выбрали ARTEM AI!</b> 🙏\n\n"
-        f"Ваша заявка уже передана специалисту. Мы свяжемся с Вами в ближайшее время — бережно и по делу.\n\n"
-        f"💡 <i>Если я был полезен, буду благодарен за рекомендацию друзьям.</i>\n\n"
-        f"❓ <b>Могу ли Я ещё чем-то быть полезен для Вас сегодня?</b>"
-    )
-
-    # 🔥 ИСПРАВЛЕНО: Чистое меню из 3 кнопок (без "Вопрос AI")
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💰 Продать", callback_data="menu_sell")],
-            [InlineKeyboardButton("🔍 Купить", callback_data="menu_buy")],
-            [InlineKeyboardButton("🔑 Аренда", callback_data="menu_rent")],
-        ]
-    )
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            final_text, reply_markup=kb, parse_mode="HTML"
-        )
-    else:
-        await update.message.reply_text(final_text, reply_markup=kb, parse_mode="HTML")
-
-    return ConversationHandler.END
 
 
 # ──────────────────────────────────────────────────────────────────────
 # БЛОК 4: ПОКУПАТЕЛЬ (Воронка: Объект -> Оплата -> Контакты)
-# ──────────────────────────────────────────────────────────────────────
+# ==============================================================
 
 
+# ═══════════════════════════════════════════
+# 🌲 ВОРОНКА ЗЕМЛЯ (полная цепочка)
+# ═══════════════════════════════════════════
+async def b_land_purpose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["land_purpose"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"🌿 {name}, отлично! Уточним детали.\n\n"
+        f"<b>Какой статус участка вас интересует?</b>",
+        reply_markup=ReplyKeyboardMarkup(
+            [["🏡 ИЖС", "🌲 СНТ"], ["◀️ Назад"]],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+    return LAND_TYPE
+
+async def b_land_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["land_type"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"📐 {name}, хорошо!\n\n<b>Сколько соток вас интересует?</b>\n"
+        f"<i>(Например: 6, 10, 15 или «от 8 до 12»)</i>",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return LAND_AREA
+
+async def b_land_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["land_area"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"📍 <b>В каком районе ищете участок, {name}?</b>\n\n"
+        f"🗺 Нажмите кнопку, чтобы <b>указать точку на карте</b>,\n"
+        f"или напишите текстом:\n"
+        f"<i>Корсаков, Южно-Сахалинск, Луговое, пригород и т.д.</i>",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["🏙 Южно-Сахалинск", "⚓ Корсаков"],
+                ["🌲 Пригород / оба города"],
+                [KeyboardButton("🗺 Показать на карте", web_app=WebAppInfo(url=f"{WEBAPP_URL}/map.html"))],
+                ["◀️ Назад"],
+            ],
+            resize_keyboard=True,
+        ),
+        parse_mode="HTML",
+    )
+    return LAND_LOC
+
+async def b_land_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["land_loc"] = update.message.text
+    await update.message.reply_text(
+        "⚡ <b>Какие коммуникации важны?</b>",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["🔥 Газ + Свет + Вода"],
+                ["💡 Свет + Вода (без газа)"],
+                ["🌿 Без коммуникаций (под себя)"],
+                ["◀️ Назад"]
+            ],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+    return LAND_COMM
+
+
+async def b_land_loc_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🗺 Обработка точки с Яндекс.Карты — воронка Земля"""
+    try:
+        data = json.loads(update.message.web_app_data.data)
+        if data.get("command") == "location_selected":
+            lat = data["lat"]
+            lon = data["lon"]
+            context.user_data["latitude"] = lat
+            context.user_data["longitude"] = lon
+            context.user_data["land_loc"] = f"📍 Карта: {lat:.5f}, {lon:.5f}"
+            await update.message.reply_text(
+                f"✅ <b>Локация записана!</b>\n"
+                f"📌 Координаты: <code>{lat:.5f}, {lon:.5f}</code>\n\n"
+                f"⚡ <b>Какие коммуникации важны?</b>",
+                reply_markup=ReplyKeyboardMarkup(
+                    [
+                        ["🔥 Газ + Свет + Вода"],
+                        ["💡 Свет + Вода (без газа)"],
+                        ["🌿 Без коммуникаций (под себя)"],
+                        ["◀️ Назад"]
+                    ],
+                    resize_keyboard=True
+                ),
+                parse_mode="HTML",
+            )
+            return LAND_COMM
+    except Exception as e:
+        loguru_logger.error(f"❌ Ошибка карты (Земля): {e}")
+    return LAND_LOC
+
+async def b_land_comm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["land_comm"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"💰 <b>Какой бюджет рассматриваете, {name}?</b>\n"
+        f"<i>(Например: 1.5 млн, 3 000 000, до 2 млн)</i>",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return BUY_BUDGET
+
+
+# ═══════════════════════════════════════════
+# 🏗️ ВОРОНКА СТРОЙКА (полная цепочка)
+# ═══════════════════════════════════════════
+async def b_builder_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["builder_search"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"🏗️ {name}, понял! Давайте подберём решение.\n\n"
+        f"<b>Какой тип дома планируете?</b>",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["🧱 Кирпич", "🪵 Брус"],
+                ["🏠 Каркасный", "📋 Другой вариант"],
+                ["◀️ Назад"]
+            ],
+            resize_keyboard=True
+        ),
+        parse_mode="HTML"
+    )
+    return BUILD_TYPE
+
+async def b_build_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["build_type"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"📐 <b>Какая планируемая площадь дома, {name}?</b>\n"
+        f"<i>(В квадратных метрах, например: 80, 120, 150)</i>",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return BUILD_AREA
+
+async def b_build_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["build_area"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"📍 <b>Где планируете строить, {name}?</b>\n\n"
+        f"🗺 Нажмите кнопку, чтобы <b>указать участок на карте</b>,\n"
+        f"или напишите текстом:\n"
+        f"<i>Корсаков, Южно-Сахалинск, Луговое, пригород и т.д.</i>",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["🏙 Южно-Сахалинск", "⚓ Корсаков"],
+                ["🌲 Пригород / оба города"],
+                [KeyboardButton("🗺 Показать на карте", web_app=WebAppInfo(url=f"{WEBAPP_URL}/map.html"))],
+                ["◀️ Назад"],
+            ],
+            resize_keyboard=True,
+        ),
+        parse_mode="HTML",
+    )
+    return BUILD_LOC
+
+
+async def b_build_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """📝 Текстовый ввод локации — воронка Стройка"""
+    context.user_data["build_loc"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"💰 <b>Бюджет на строительство, {name}?</b>\n"
+        f"<i>(Например: 5 млн, 8 000 000)</i>",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML",
+    )
+    return BUY_BUDGET
+
+
+async def b_build_loc_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🗺 Обработка точки с Яндекс.Карты — воронка Стройка"""
+    try:
+        data = json.loads(update.message.web_app_data.data)
+        if data.get("command") == "location_selected":
+            lat = data["lat"]
+            lon = data["lon"]
+            context.user_data["latitude"] = lat
+            context.user_data["longitude"] = lon
+            context.user_data["build_loc"] = f"📍 Карта: {lat:.5f}, {lon:.5f}"
+            name = context.user_data.get("name", "")
+            await update.message.reply_text(
+                f"✅ <b>Участок на карте записан!</b>\n"
+                f"📌 Координаты: <code>{lat:.5f}, {lon:.5f}</code>\n\n"
+                f"💰 <b>Бюджет на строительство, {name}?</b>\n"
+                f"<i>(Например: 5 млн, 8 000 000)</i>",
+                reply_markup=get_back_kb(),
+                parse_mode="HTML",
+            )
+            return BUY_BUDGET
+    except Exception as e:
+        loguru_logger.error(f"❌ Ошибка карты (Стройка): {e}")
+    return BUILD_LOC
+
+async def b_build_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["build_time"] = update.message.text
+    name = context.user_data.get("name", "")
+    await update.message.reply_text(
+        f"✨ <b>Отлично, {name}!</b> Я записал все детали.\n\n"
+        f"📞 Осталось последнее — <b>номер телефона</b>, чтобы Андрей "
+        f"мог связаться с вами и обсудить проект лично.",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
+    )
+    return BUY_PHONE
+
+
+# --- ОСНОВНАЯ ВОРОНКА ПОКУПАТЕЛЯ ---
 async def b_obj(u, c):
     c.user_data["object"] = (
         u.message.text.replace("🏠 ", "")
@@ -1108,16 +1435,60 @@ async def b_obj(u, c):
         .replace("🌲 ", "")
         .replace("🏗️ ", "")
     )
+
+    # 🔥 ВЕТВЛЕНИЕ ДЛЯ ЗЕМЛИ И СТРОЙКИ
+    if c.user_data["object"] == "Земля":
+        await u.message.reply_text(
+            "🏞️ <b>Вы ищете участок под застройку или для других целей?</b>",
+            reply_markup=ReplyKeyboardMarkup(
+                [["🏡 Под строительство", "🌿 Для других целей"]],
+                resize_keyboard=True
+            ),
+            parse_mode="HTML"
+        )
+        return BUY_LAND_PURPOSE
+
+    if c.user_data["object"] == "Стройка":
+        await u.message.reply_text(
+            "🏗️ <b>У Вас уже есть участок или Вы ищете подрядчика?</b>",
+            reply_markup=ReplyKeyboardMarkup(
+                [["🔨 Ищу строителей", "🏡 Строю с нуля"]],
+                resize_keyboard=True
+            ),
+            parse_mode="HTML"
+        )
+        return BUY_BUILDER_SEARCH
+
+    # ДЛЯ ВСЕХ ОСТАЛЬНЫХ ОБЪЕКТОВ
     await u.message.reply_text(
-        "📍 <b>Какой район или город рассматриваете?</b>",
-        reply_markup=get_back_kb(),
+        "📍 <b>Какой район или город рассматриваете?</b>\n"
+        "<i>Корсаков, Южно-Сахалинск, пригород — напишите или выберите:</i>",
+        reply_markup=ReplyKeyboardMarkup(
+            [
+                ["🏙 Южно-Сахалинск", "⚓ Корсаков"],
+                ["🌲 Пригород / оба города"],
+                ["◀️ Назад"],
+            ],
+            resize_keyboard=True,
+        ),
         parse_mode="HTML",
+    )
+    return BUY_SOTOK
+
+
+# ШАГ: ВВОД КОЛИЧЕСТВА СОТОК
+async def b_sotok(u, c):
+    c.user_data["sotki"] = parse_number(u.message.text)
+    await u.message.reply_text(
+        "📍<b>Сколько соток подыскиваете?</b>",
+        reply_markup=get_back_kb(),
+        parse_mode="HTML"
     )
     return BUY_LOC
 
 
 async def b_loc(u, c):
-    c.user_data["location"] = clean(u.message.text)
+    c.user_data["location"] = u.message.text
     await u.message.reply_text(
         "💰 <b>Какой бюджет?</b> (руб)", reply_markup=get_back_kb(), parse_mode="HTML"
     )
@@ -1125,7 +1496,37 @@ async def b_loc(u, c):
 
 
 async def b_budget(u, c):
-    c.user_data["price"] = clean(u.message.text)
+    c.user_data["price"] = parse_number(u.message.text)
+    obj = c.user_data.get("object", "")
+    name = c.user_data.get("name", "")
+
+    # 🔥 Роутинг для Земли и Стройки
+    if obj == "Земля":
+        await u.message.reply_text(
+            f"✨ <b>Записал, {name}!</b>\n\n"
+            f"📞 Осталось получить ваш <b>номер телефона</b>, "
+            f"чтобы Андрей мог подобрать для вас идеальный участок.",
+            reply_markup=get_back_kb(),
+            parse_mode="HTML"
+        )
+        return BUY_PHONE
+
+    if obj == "Стройка":
+        await u.message.reply_text(
+            f"🗓️ <b>{name}, когда планируете начать строительство?</b>",
+            reply_markup=ReplyKeyboardMarkup(
+                [
+                    ["🔥 Как можно скорее", "📅 В этом году"],
+                    ["🕐 В следующем году", "💭 Пока планирую"],
+                    ["◀️ Назад"]
+                ],
+                resize_keyboard=True
+            ),
+            parse_mode="HTML"
+        )
+        return BUILD_TIME
+
+    # Стандартный путь для квартиры/дома/аренды
     await u.message.reply_text(
         "🏘 <b>Что важно рядом?</b>\n(школа, сад, транспорт, лес...)",
         reply_markup=get_back_kb(),
@@ -1135,7 +1536,7 @@ async def b_budget(u, c):
 
 
 async def b_infra(u, c):
-    c.user_data["infra"] = clean(u.message.text)
+    c.user_data["infra"] = u.message.text
     await u.message.reply_text(
         " <b>Для кого подыскиваете?</b>\n(семья, инвестиция, родители...)",
         reply_markup=get_back_kb(),
@@ -1207,7 +1608,7 @@ async def b_pay(u, c):
 # Обработчики ответов на оплату
 async def b_mort(u, c):
     c.user_data["payment"] = "Ипотека"
-    c.user_data["mortgage_status"] = clean(u.message.text)
+    c.user_data["mortgage_status"] = parse_number(u.message.text)
 
     # 🔥 ДОБАВЛЕНО: Твоё предложение рассчитать ипотеку
     await u.message.reply_text(
@@ -1224,19 +1625,19 @@ async def b_mort(u, c):
 
 async def b_cert(u, c):
     c.user_data["payment"] = "Сертификат"
-    c.user_data["cert_details"] = clean(u.message.text)
+    c.user_data["cert_details"] = parse_number(u.message.text)
     return await b_time(u, c)
 
 
 async def b_guarantee(u, c):
     c.user_data["payment"] = "Гарант. письмо"
-    c.user_data["guarantee_details"] = clean(u.message.text)
+    c.user_data["guarantee_details"] = parse_number(u.message.text)
     return await b_time(u, c)
 
 
 async def b_matcap(u, c):
     c.user_data["payment"] = "Мат.капитал"
-    c.user_data["matcap_rest"] = clean(u.message.text)
+    c.user_data["matcap_rest"] = parse_number(u.message.text)
     return await b_time(u, c)
 
 
@@ -1275,7 +1676,7 @@ async def r_dur(u, c):
 
 
 async def r_occ(u, c):
-    c.user_data["occupants"] = clean(u.message.text)
+    c.user_data["occupants"] = u.message.text
     await u.message.reply_text(
         "💰 <b>Какой бюджет в месяц?</b> (руб)",
         reply_markup=get_back_kb(),
@@ -1285,7 +1686,7 @@ async def r_occ(u, c):
 
 
 async def r_budget(u, c):
-    c.user_data["budget_rent"] = clean(u.message.text)
+    c.user_data["budget_rent"] = parse_number(u.message.text)
     await u.message.reply_text(
         "🏘 <b>Пожелания?</b>\n(ремонт, мебель, техника, парковка...)",
         reply_markup=get_back_kb(),
@@ -1295,7 +1696,7 @@ async def r_budget(u, c):
 
 
 async def r_prefs(u, c):
-    c.user_data["prefs_rent"] = clean(u.message.text)
+    c.user_data["prefs_rent"] = u.message.text
     c.user_data["timing"] = "Аренда"
     return await ask_phone_geo(u, c)
 
@@ -1324,13 +1725,13 @@ async def mort_choice(u, c):
 
 async def mort_buy(u, c):
     c.user_data["type"] = "mortgage_buy"
-    c.user_data["mortgage_status"] = clean(u.message.text)
+    c.user_data["mortgage_status"] = parse_number(u.message.text)
     return await ask_phone_geo(u, c)
 
 
 async def mort_sell(u, c):
     c.user_data["type"] = "mortgage_sell"
-    c.user_data["mortgage_details"] = clean(u.message.text)
+    c.user_data["mortgage_details"] = parse_number(u.message.text)
     return await ask_phone_geo(u, c)
 
 
@@ -1346,7 +1747,7 @@ async def sell_phone(update, context):
         context.user_data["latitude"] = update.message.location.latitude
         context.user_data["longitude"] = update.message.location.longitude
     else:
-        context.user_data["phone"] = clean(update.message.text)
+        context.user_data["phone"] = parse_number(update.message.text)
     return await ask_add_more(update, context)
 
 
@@ -1357,7 +1758,7 @@ async def buy_phone(update, context):
         context.user_data["latitude"] = update.message.location.latitude
         context.user_data["longitude"] = update.message.location.longitude
     else:
-        context.user_data["phone"] = clean(update.message.text)
+        context.user_data["phone"] = parse_number(update.message.text)
     return await ask_add_more(update, context)
 
 
@@ -1368,13 +1769,13 @@ async def rent_phone(update, context):
         context.user_data["latitude"] = update.message.location.latitude
         context.user_data["longitude"] = update.message.location.longitude
     else:
-        context.user_data["phone"] = clean(update.message.text)
+        context.user_data["phone"] = parse_number(update.message.text)
     return await ask_add_more(update, context)
 
 
 async def ask_add_more(update, context):
     """🔥 Показываем резюме и спрашиваем, нужно ли добавить детали"""
-    name = context.user_data.get("client_name", "друг")
+    name = context.user_data["client_name"]
     summary = (
         f"📋 <b>Резюме вашей заявки, {name}:</b>\n\n"
         f"• Объект: {context.user_data.get('object', '?')}\n"
@@ -1407,120 +1808,6 @@ async def handle_add_more(update, context):
 async def save_note_and_finish(update, context):
     context.user_data["edit_note"] = update.message.text
     return await final_thanks_and_send(update, context)
-
-
-async def final_thanks_and_send(update, context):
-    """🎯 Детальная карточка -> Сохраняем -> Шлём тебе -> Благодарим"""
-    await save_lead(context)
-    name = context.user_data.get("client_name", "Клиент")
-
-    summary = [
-        f"🆕 <b>НОВАЯ ЗАЯВКА [{context.user_data.get('type', '?').upper()}]</b>",
-        f"👤 Клиент: {name}",
-        f"📞 Телефон: {context.user_data.get('phone', '?')}",
-    ]
-
-    obj = context.user_data.get("object", "?")
-
-    summary.append(f"\n🏠 <b>ОБЪЕКТ:</b>")
-    summary.append(f"• Тип: {obj}")
-    summary.append(f"• Район: {context.user_data.get('location', '?')}")
-
-    if obj in ["Дом", "Стройка", "Земля", "Коммерция"]:
-        if context.user_data.get("area"):
-            summary.append(f"• Площадь: {context.user_data['area']}")
-        if context.user_data.get("ownership"):
-            summary.append(f"• В собственности: {context.user_data['ownership']}")
-        if context.user_data.get("docs"):
-            summary.append(f"• Документы: {context.user_data['docs']}")
-
-    summary.append(f"\n💰 <b>ФИНАНСЫ:</b>")
-    price = context.user_data.get("price")
-    budget = context.user_data.get("budget_rent")
-    if price:
-        summary.append(f"• Цена: {price} ₽")
-    if budget:
-        summary.append(f"• Бюджет: {budget} ₽/мес")
-
-    enc = context.user_data.get("encumbrance")
-    pay = context.user_data.get("payment")
-    if enc and enc != "Нет":
-        summary.append(f"• Обременение: {enc}")
-    if pay:
-        summary.append(f"• Оплата: {pay}")
-
-    if context.user_data.get("mortgage_details"):
-        summary.append(f"• Ипотека: {context.user_data['mortgage_details']}")
-    if context.user_data.get("mortgage_status"):
-        summary.append(f"• Статус: {context.user_data['mortgage_status']}")
-    if context.user_data.get("cert_details"):
-        summary.append(f"• Сертификат: {context.user_data['cert_details']}")
-    if context.user_data.get("guarantee_details"):
-        summary.append(f"• Гарантия: {context.user_data['guarantee_details']}")
-    if context.user_data.get("matcap_rest"):
-        summary.append(f"• Мат.капитал: {context.user_data['matcap_rest']}")
-
-    if context.user_data.get("children_count"):
-        summary.append(f"\n👶 <b>ДЕТИ:</b>")
-        summary.append(f"• Количество: {context.user_data['children_count']}")
-        if context.user_data.get("children_ages"):
-            summary.append(f"• Возраст: {context.user_data['children_ages']}")
-        if context.user_data.get("housing_found"):
-            summary.append(f"• Жильё найдено: {context.user_data['housing_found']}")
-
-    if context.user_data.get("timing"):
-        summary.append(
-            f"\n⏰ <b>СРОКИ:</b>\n• Планирует: {context.user_data['timing']}"
-        )
-
-    if context.user_data.get("infra"):
-        summary.append(f"\n🏘 <b>ИНФРАСТРУКТУРА:</b>\n{context.user_data['infra']}")
-
-    lat, lon = context.user_data.get("latitude"), context.user_data.get("longitude")
-    if lat and lon:
-        summary.append(
-            f"\n📍 <b>ГЕОЛОКАЦИЯ:</b>\n🗺 <a href='https://yandex.ru/maps/?pt={lon},{lat}&z=16&l=map'>Открыть на карте</a>"
-        )
-
-    if context.user_data.get("edit_note"):
-        summary.append(f"\n📝 <b>ЗАМЕТКА:</b>\n{context.user_data['edit_note']}")
-
-    summary_text = "\n".join(summary)
-
-    if ADMIN_CHAT_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=summary_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки: {e}")
-
-    final_text = (
-        f"✨ <b>Благодарю Вас, {name}, что выбрали ARTEM AI!</b> 🙏\n\n"
-        f"Ваша заявка уже передана специалисту. Мы свяжемся с Вами в ближайшее время — бережно и по делу.\n\n"
-        f"❓ <b>Могу ли Я ещё чем-то быть полезен для Вас сегодня?</b>"
-    )
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💰 Продать", callback_data="menu_sell")],
-            [InlineKeyboardButton("🔍 Купить", callback_data="menu_buy")],
-            [InlineKeyboardButton("🔑 Аренда", callback_data="menu_rent")],
-            [InlineKeyboardButton("🧮 Ипотека", callback_data="menu_mort")],
-            [InlineKeyboardButton("🤖 Вопрос AI", callback_data="nav_ai")],
-        ]
-    )
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            final_text, reply_markup=kb, parse_mode="HTML"
-        )
-    else:
-        await update.message.reply_text(final_text, reply_markup=kb, parse_mode="HTML")
-
-    return ConversationHandler.END
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1557,7 +1844,7 @@ async def mort_rate(u, c):
     c.user_data["mortgage_info"] = u.message.text
     c.user_data["payment"] = "Ипотека"
     c.user_data["type"] = "buy"
-    name = c.user_data.get("client_name", "друг")
+    name = c.user_data["client_name"]
 
     await u.message.reply_text(
         f"📞 <b>{name}, данные приняты.</b>\n\n"
@@ -1576,10 +1863,10 @@ async def mort_rate(u, c):
 
 
 async def mort_res(u, c):
-    c.user_data["mortgage_balance"] = u.message.text
+    c.user_data["mortgage_balance"] = parse_number(u.message.text)
     c.user_data["payment"] = "Ипотека (Продажа)"
     c.user_data["type"] = "sell"
-    name = c.user_data.get("client_name", "друг")
+    name = c.user_data["client_name"]
 
     await u.message.reply_text(
         f"📞 <b>{name}, данные приняты.</b>\n\n"
@@ -1603,7 +1890,7 @@ async def mort_res(u, c):
 
 
 async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = clean(update.message.text)
+    t = update.message.text
 
     # 🔹 Если клиент прислал номер в чате с AI
     phone_match = re.search(r"\+?7?\s*\(?\d{3}\)?\s*\d{3}[- ]?\d{2}[- ]?\d{2}", t)
@@ -1624,12 +1911,37 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    # 🔹 Если клиент спрашивает про другой город/регион — эскалация к менеджеру
+    _other_city_keys = [
+        "другой город", "другом городе", "другом регионе", "москва", "владивосток",
+        "хабаровск", "санкт-петербург", "спб", "новосибирск", "краснодар",
+        "работаете в", "охватываете", "по всей стране", "другой регион",
+    ]
+    if any(w in t.lower() for w in _other_city_keys):
+        name = context.user_data.get("client_name", "Клиент")
+        await update.message.reply_text(
+            f"🗺 <b>{name}</b>, по этому вопросу более полную информацию "
+            f"Вам лучше уточнить у нашего менеджера — он расскажет всё детально "
+            f"и предложит оптимальное решение.\n\n"
+            f"Я передам ваши данные ему. Оставьте, пожалуйста, номер телефона — "
+            f"менеджер свяжется с вами в ближайшее время! 📞",
+            reply_markup=ReplyKeyboardMarkup(
+                [
+                    [KeyboardButton("📱 Отправить номер", request_contact=True)],
+                    ["◀️ Назад"],
+                ],
+                resize_keyboard=True,
+            ),
+            parse_mode="HTML",
+        )
+        return BUY_PHONE
+
     # 🔹 Если клиент запутался — эскалация менеджеру
     if any(
         w in t.lower()
         for w in ["запутался", "сложно", "помогите", "позвоните", "перезвоните"]
     ):
-        name = context.user_data.get("client_name", "друг")
+        name = context.user_data["client_name"]
         await update.message.reply_text(
             f"🤝 <b>{name}</b>, вижу, что вопросов много. Давайте наш менеджер перезвонит вам?\n"
             f"Это бесплатно и ни к чему не обязывает.\n\n"
@@ -1660,7 +1972,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_menu_with_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🎯 Меню с визиткой + подсказки"""
-    name = context.user_data.get("client_name", "друг")
+    name = context.user_data["client_name"]
     txt = (
         f"✨ <b>Понял вас, {name}!</b>\n\n"
         f"💡 Могу ли я ещё чем-то помочь вам сегодня?\n\n"
@@ -1805,12 +2117,12 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_phone_geo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🔥 Умный запрос контактов и геолокации"""
-    name = context.user_data.get("client_name", "друг")
+    name = context.user_data["client_name"]
     kb = ReplyKeyboardMarkup(
         [
             [
                 KeyboardButton("📱 Отправить номер", request_contact=True),
-                KeyboardButton("📍 Указать объект на карте", request_location=True),
+                KeyboardButton("📍 Открыть карту", web_app=WebAppInfo(url=f"{WEBAPP_URL}/map.html")),
             ],
             ["◀️ Назад"],
             ["❌ Отмена"],
@@ -1852,7 +2164,7 @@ async def sell_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return SELL_PHONE
         return await ask_add_more(update, context)
     else:
-        context.user_data["phone"] = clean(update.message.text)
+        context.user_data["phone"] = parse_number(update.message.text)
         return await ask_add_more(update, context)
 
 
@@ -1872,7 +2184,7 @@ async def buy_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return BUY_PHONE
         return await ask_add_more(update, context)
     else:
-        context.user_data["phone"] = clean(update.message.text)
+        context.user_data["phone"] = parse_number(update.message.text)
         return await ask_add_more(update, context)
 
 
@@ -1892,13 +2204,13 @@ async def rent_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return RENT_PHONE
         return await ask_add_more(update, context)
     else:
-        context.user_data["phone"] = clean(update.message.text)
+        context.user_data["phone"] = parse_number(update.message.text)
         return await ask_add_more(update, context)
 
 
 # ── Подтверждение и заметка ──
 async def ask_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = context.user_data.get("client_name", "друг")
+    name = context.user_data["client_name"]
     summary = (
         f"📋 <b>Резюме, {name}:</b>\n\n"
         f"• Объект: {context.user_data.get('object', '?')}\n"
@@ -1949,9 +2261,39 @@ async def final_thanks_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     # 🏠 Блок объекта
     summary.append(f"\n🏠 <b>ОБЪЕКТ:</b>")
     summary.append(f"• Тип: {obj}")
-    summary.append(f"• Район: {context.user_data.get('location', '?')}")
 
-    if obj in ["Дом", "Стройка", "Земля", "Коммерция"]:
+    if obj == "Земля":
+        # 🌲 Специфика Земли
+        summary.append(f"• Цель: {context.user_data.get('land_purpose', '?')}")
+        summary.append(f"• Статус: {context.user_data.get('land_type', '?')}")
+        summary.append(f"• Площадь: {context.user_data.get('land_area', '?')} сот.")
+        _land_loc = context.user_data.get('land_loc', context.user_data.get('location', '?'))
+        _land_lat = context.user_data.get("latitude")
+        _land_lon = context.user_data.get("longitude")
+        _land_map = (
+            f" · <a href='https://yandex.ru/maps/?pt={_land_lon},{_land_lat}&z=16&l=map'>🗺 Карта</a>"
+            f" · <a href='https://yandex.ru/maps/?pt={_land_lon},{_land_lat}&z=16&l=sat'>🛰 Спутник</a>"
+            if _land_lat and _land_lon else ""
+        )
+        summary.append(f"• Район: {_land_loc}{_land_map}")
+        summary.append(f"• Коммуникации: {context.user_data.get('land_comm', '?')}")
+    elif obj == "Стройка":
+        # 🏗️ Специфика Стройки
+        summary.append(f"• Ситуация: {context.user_data.get('builder_search', '?')}")
+        summary.append(f"• Тип дома: {context.user_data.get('build_type', '?')}")
+        summary.append(f"• Площадь дома: {context.user_data.get('build_area', '?')} м²")
+        _build_loc = context.user_data.get('build_loc', context.user_data.get('location', '?'))
+        _build_lat = context.user_data.get("latitude")
+        _build_lon = context.user_data.get("longitude")
+        _build_map = (
+            f" · <a href='https://yandex.ru/maps/?pt={_build_lon},{_build_lat}&z=16&l=map'>🗺 Карта</a>"
+            f" · <a href='https://yandex.ru/maps/?pt={_build_lon},{_build_lat}&z=16&l=sat'>🛰 Спутник</a>"
+            if _build_lat and _build_lon else ""
+        )
+        summary.append(f"• Район/Участок: {_build_loc}{_build_map}")
+        summary.append(f"• Сроки начала: {context.user_data.get('build_time', '?')}")
+    else:
+        summary.append(f"• Район: {context.user_data.get('location', '?')}")
         if context.user_data.get("area"):
             summary.append(f"• Площадь: {context.user_data['area']}")
         if context.user_data.get("ownership"):
@@ -2011,12 +2353,75 @@ async def final_thanks_and_send(update: Update, context: ContextTypes.DEFAULT_TY
     lat, lon = context.user_data.get("latitude"), context.user_data.get("longitude")
     if lat and lon:
         summary.append(
-            f"\n📍 <b>ГЕОЛОКАЦИЯ:</b>\n🗺 <a href='https://yandex.ru/maps/?pt={lon},{lat}&z=16&l=map'>Открыть на карте</a>"
+            f"\n📍 <b>ЛОКАЦИЯ:</b>\n"
+            f"🗺 <a href='https://yandex.ru/maps/?pt={lon},{lat}&z=16&l=map'>Карта</a>  "
+            f"🛰 <a href='https://yandex.ru/maps/?pt={lon},{lat}&z=16&l=sat'>Спутник</a>  "
+            f"📌 <code>{lat:.5f}, {lon:.5f}</code>"
         )
 
     # 📝 Заметка
     if context.user_data.get("edit_note"):
         summary.append(f"\n📝 <b>ЗАМЕТКА:</b>\n{context.user_data['edit_note']}")
+
+    # 🔒 СЕКРЕТНЫЙ БЛОК ДЛЯ АНДРЕЯ (инсайты по клиенту)
+    secret = []
+
+    # — Общие инсайты —
+    timing = str(context.user_data.get("timing", "") or context.user_data.get("build_time", "")).lower()
+    if "срочно" in timing or "как можно скорее" in timing:
+        secret.append("🔥 Клиент торопится — звонить первым!")
+    if "изучаю" in timing or "смотр" in timing or "пока планирую" in timing:
+        secret.append("👀 Пока мониторит рынок — не давить, мягко удерживать")
+    if not context.user_data.get("price"):
+        secret.append("💰 Бюджет не указан → уточнить при звонке")
+    if context.user_data.get("encumbrance") == "Ипотека":
+        secret.append("🏦 Нужна помощь с банком / одобрением")
+    if context.user_data.get("encumbrance") in ["Опека", "Арест"]:
+        secret.append("⚖️ Сложная сделка → подключить юриста")
+
+    # — Инсайты для Земли —
+    if obj == "Земля":
+        land_type = context.user_data.get("land_type", "")
+        land_comm = context.user_data.get("land_comm", "")
+        land_purpose = context.user_data.get("land_purpose", "")
+        secret.append("🌲 Спец. объект: земельный участок")
+        if "ИЖС" in land_type:
+            secret.append("📋 ИЖС → проверить категорию земли и разрешённое использование")
+        if "СНТ" in land_type:
+            secret.append("🌿 СНТ → уточнить возможность перевода в ИЖС")
+        if "Без коммуникаций" in land_comm:
+            secret.append("⚡ Клиент готов к участку без ком. — уточнить стоимость подведения")
+        if "Газ" in land_comm:
+            secret.append("🔥 Важен газ → проверить наличие газопровода в районе")
+        if "Под строительство" in land_purpose:
+            secret.append("🏡 Цель — стройка → предложить связку Земля+Подрядчик")
+        secret.append("📐 Уточнить межевание и кадастровый номер")
+
+    # — Инсайты для Стройки —
+    elif obj == "Стройка":
+        build_type = context.user_data.get("build_type", "")
+        build_area = context.user_data.get("build_area", "")
+        builder_search = context.user_data.get("builder_search", "")
+        secret.append("🏗️ Спец. объект: строительство под ключ")
+        if "Кирпич" in build_type:
+            secret.append("🧱 Кирпич → долго и дорого, уточнить смету и сроки")
+        if "Каркасный" in build_type:
+            secret.append("🏠 Каркас → быстро и бюджетно, есть готовые проекты")
+        if "Брус" in build_type:
+            secret.append("🪵 Брус → экологично, уточнить проект и усадку")
+        if build_area:
+            secret.append(f"📐 Площадь {build_area} м² → запросить предварительную смету")
+        if "Ищу строителей" in builder_search:
+            secret.append("🔨 Нет подрядчика → предложить проверенные бригады Андрея")
+        if "Строю с нуля" in builder_search:
+            secret.append("🏗️ Строит с нуля → предложить полное сопровождение")
+        secret.append("📋 Запросить ТЗ и план участка для расчёта сметы")
+
+    if secret:
+        summary.append(
+            "\n\n🔒 <b>СЕКРЕТНО ДЛЯ АНДРЕЯ:</b>\n"
+            + "\n".join(f"• {s}" for s in secret)
+        )
 
     # Собираем в одну строку
     summary_text = "\n".join(summary)
@@ -2039,17 +2444,25 @@ async def final_thanks_and_send(update: Update, context: ContextTypes.DEFAULT_TY
         f"Ваша заявка уже передана специалисту. Мы свяжемся с Вами в ближайшее время — бережно и по делу.\n\n"
         f"❓ <b>Могу ли Я ещё чем-то быть полезен для Вас сегодня?</b>"
     )
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("💰 Продать", callback_data="menu_sell")],
-            [InlineKeyboardButton("🔍 Купить", callback_data="menu_buy")],
-            [InlineKeyboardButton("🔑 Аренда", callback_data="menu_rent")],
-            [
-                InlineKeyboardButton("🧮 Ипотека", callback_data="menu_mortgage")
-            ],  # 🔥 Исправлено на menu_mortgage
-            [InlineKeyboardButton("🤖 Вопрос AI", callback_data="nav_ai")],
-        ]
+    _fin_lat = context.user_data.get("latitude")
+    _fin_lon = context.user_data.get("longitude")
+    _map_row = (
+        [InlineKeyboardButton(
+            "📍 Показать на карте",
+            url=f"https://yandex.ru/maps/?pt={_fin_lon},{_fin_lat}&z=16&l=map"
+        )]
+        if _fin_lat and _fin_lon else []
     )
+    kb_rows = [
+        [InlineKeyboardButton("💰 Продать", callback_data="menu_sell")],
+        [InlineKeyboardButton("🔍 Купить", callback_data="menu_buy")],
+        [InlineKeyboardButton("🔑 Аренда", callback_data="menu_rent")],
+        [InlineKeyboardButton("🧮 Ипотека", callback_data="menu_mortgage")],
+        [InlineKeyboardButton("🤖 Вопрос AI", callback_data="nav_ai")],
+    ]
+    if _map_row:
+        kb_rows.insert(0, _map_row)
+    kb = InlineKeyboardMarkup(kb_rows)
 
     if update.callback_query:
         await update.callback_query.edit_message_text(
@@ -2090,7 +2503,7 @@ async def trigger_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
     else:
-        name = context.user_data.get("client_name", "друг")
+        name = context.user_data["client_name"]
         await update.message.reply_text(
             f"🤔 <b>{name}</b>, понял запрос. Для точного ответа выберите раздел:\n"
             "💰 Продать | 🔍 Купить | 🔑 Аренда | 🧮 Ипотека\n\n"
@@ -2122,7 +2535,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
         }
         if cmd in COMMAND_MAP:
             update.message.text = COMMAND_MAP[cmd]
-            name = context.user_data.get("client_name", "друг")
+            name = context.user_data["client_name"]
             await update.message.reply_text(
                 f"✅ <b>{name}</b>, вы выбрали: {COMMAND_MAP[cmd]}\n"
                 f"Запускаю процесс... 🚀\n\n"
@@ -2139,7 +2552,7 @@ async def safety_net(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return CHOICE
 
-    name = context.user_data.get("client_name", "друг")
+    name = context.user_data["client_name"]
     await update.message.reply_text(
         f"🤖 <b>{name}</b>, я вас не совсем понял.\n\n"
         f"Чтобы не терять время на переписку и дать вам максимально точный ответ, "
@@ -2236,17 +2649,22 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(f"❌ ОШИБКА [{error_type}]: {error_msg}")
 
 
+
 # ──────────────────────────────────────────────────────────────────────
 # 17. ЗАПУСК — сборка всего воедино
 # ──────────────────────────────────────────────────────────────────────
-
 def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_error_handler(error_handler)
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start_cmd)],
+        entry_points=[
+            CommandHandler("start", start_cmd),
+            CallbackQueryHandler(handle_sell, pattern="^menu_sell$"),
+            CallbackQueryHandler(handle_buy, pattern="^menu_buy$"),
+            CallbackQueryHandler(handle_rent, pattern="^menu_rent$")
+        ],
         states={
             # === ПРИВЕТСТВИЕ ===
             GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
@@ -2259,6 +2677,13 @@ def main():
             ],
             # === ПРОДАВЕЦ ===
             SELL_OBJ: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_obj)],
+            SELL_SOTOK: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_sotok)],
+            SELL_MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_material)],
+            SELL_OWNERSHIP: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_ownership)],
+            SELL_KADASTR: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_kadastr)],
+            SELL_FUNDAMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_fundament)],
+            SELL_OBREM: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_obrem)],
+            SELL_YEARS: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_years)],
             SELL_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_loc)],
             SELL_AREA: [MessageHandler(area_filter, s_area)],
             SELL_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_time)],
@@ -2288,6 +2713,23 @@ def main():
             ],
             # === ПОКУПАТЕЛЬ ===
             BUY_OBJ: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_obj)],
+            BUY_SOTOK: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_sotok)],
+            BUY_LAND_PURPOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_land_purpose)],
+            LAND_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_land_type)],
+            LAND_AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_land_area)],
+            LAND_LOC: [
+                MessageHandler(filters.StatusUpdate.WEB_APP_DATA, b_land_loc_map),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, b_land_loc),
+            ],
+            LAND_COMM: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_land_comm)],
+            BUY_BUILDER_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_builder_search)],
+            BUILD_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_build_type)],
+            BUILD_AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_build_area)],
+            BUILD_LOC: [
+                MessageHandler(filters.StatusUpdate.WEB_APP_DATA, b_build_loc_map),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, b_build_loc),
+            ],
+            BUILD_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_build_time)],
             BUY_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_loc)],
             BUY_BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_budget)],
             BUY_INFRA: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_infra)],
